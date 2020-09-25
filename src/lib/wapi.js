@@ -758,6 +758,39 @@ window.WAPI.getMessageById = function (id) {
         return result;
 };
 
+window.WAPI.sendMessageToID = function (id, message) {
+    try {
+        window.getContact = (id) => {
+            return Store.WapQuery.queryExist(id);
+        }
+        return window.getContact(id).then(contact => {
+            if (contact.status === 404) {
+                return true
+            } else {
+                Store.Chat.find(contact.jid).then(chat => {
+                    chat.sendMessage(message);
+                    return true;
+                }).catch(reject => {
+                    if (WAPI.sendMessage(id, message)) {
+                        return true;
+                    } else {
+                        return false;
+                    }
+                });
+            }
+        });
+    } catch (e) {
+        if (window.Store.Chat.length === 0) return false;
+        firstChat = Store.Chat.models[0];
+        var originalID = firstChat.id;
+        firstChat.id = typeof originalID === "string" ? id : new window.Store.UserConstructor(id, { intentionallyUsePrivateConstructor: true });
+            firstChat.sendMessage(message);
+            firstChat.id = originalID;
+            return true;
+    }
+    return false;
+}
+
 window.WAPI.sendMessageWithMentions = async function (ch, body) {
     var chat = ch.id ? ch : Store.Chat.get(ch);
     var chatId = chat.id._serialized;
