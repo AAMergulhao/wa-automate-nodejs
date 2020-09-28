@@ -788,7 +788,6 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
       ({ to, content }) => {
         WAPI.sendSeen(to);
         WAPI.sendMessageToID(to, content);
-        return WAPI.sendMessage(to, content);
       },
       { to, content }
     );
