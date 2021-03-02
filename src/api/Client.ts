@@ -12,7 +12,9 @@ import PQueue from 'p-queue'
 const parseFunction = require('parse-function'),
 pkg = require('../../package.json'),
 datauri = require('datauri'),
-fs = require('fs');
+fs = require('fs'),
+isUrl = require('is-url'),
+isDataURL = (s: string) => !!s.match(/^data:((?:\w+\/(?:(?!;).)+)?)((?:;[\w\W]*?[^;])*),(.+)$/g);
 import treekill from 'tree-kill';
 import { SessionInfo } from './model/sessionInfo';
 import { injectApi } from '../controllers/browser';
@@ -21,6 +23,21 @@ import { ChatId, GroupChatId, Content, Base64, MessageId, ContactId, DataURL, Fi
 import { bleachMessage, decryptMedia } from '@open-wa/wa-decrypt';
 import * as path from 'path';
 import { CustomProduct } from './model/product';
+
+interface CreateSize {
+  width?: number;
+  height?: number;
+}
+
+const ERRORS_ARRAY = [
+  'Not able to send message to broadcast',
+  'ERROR: not a contact',
+  'ERROR: not a valid Whatsapp',
+  'ERROR: Please make sure you have at least one chat',
+  'ERROR: create active chat',
+  'ERROR: send message',
+  'ERROR: not a valid chat'
+];
 
 export enum namespace {
   Chat = 'Chat',
@@ -31,13 +48,14 @@ export enum namespace {
 
 export enum SimpleListener {
   Message = 'onMessage',
-  AnyMessage = 'onAnyMessage',
+  //AnyMessage = 'onAnyMessage',
+  MessageDeleted = 'onMessageDeleted',
   Ack = 'onAck',
-  AddedToGroup = 'onAddedToGroup',
+  //AddedToGroup = 'onAddedToGroup',
   Battery = 'onBattery',
   ChatOpened = 'onChatOpened',
   IncomingCall = 'onIncomingCall',
-  GlobalParicipantsChanged = 'onGlobalParicipantsChanged',
+  //GlobalParicipantsChanged = 'onGlobalParicipantsChanged',
   ChatState = 'onChatState',
   // Next two require extra params so not available to use via webhook register
   // LiveLocation = 'onLiveLocation',
@@ -45,9 +63,9 @@ export enum SimpleListener {
   Plugged = 'onPlugged',
   StateChanged = 'onStateChanged',
   //require licences
-  Story = 'onStory',
-  RemovedFromGroup = 'onRemovedFromGroup',
-  ContactAdded = 'onContactAdded',
+  //Story = 'onStory',
+  //RemovedFromGroup = 'onRemovedFromGroup',
+  //ContactAdded = 'onContactAdded',
 }
 
 /**
@@ -132,18 +150,19 @@ declare module WAPI {
   const addParticipant: (groupId: string, contactId: string) => void;
   const sendGiphyAsSticker: (chatId: string, url: string) => Promise<any>;
   const getMessageById: (mesasgeId: string) => Message;
+  const getMyLastMessage: (chatId: string) => Message;
   const getStickerDecryptable: (mesasgeId: string) => Message | boolean;
   const forceStaleMediaUpdate: (mesasgeId: string) => Message | boolean;
   const setMyName: (newName: string) => Promise<boolean>;
   const setMyStatus: (newStatus: string) => void;
-  const setProfilePic: (data: string) => Promise<boolean>;
+  const setProfilePic: (b64X96: string, b64X640:string, to: string) => Promise<boolean>;
   const setPresence: (available: boolean) => void;
   const getMessageReaders: (messageId: string) => Contact[];
   const getStatus: (contactId: string) => void;
   const getCommonGroups: (contactId: string) => Promise<{id:string,title:string}[]>;
   const forceUpdateLiveLocation: (chatId: string) => Promise<LiveLocationChangedEvent []> | boolean;
   const setGroupIcon: (groupId: string, imgData: string) => Promise<boolean>;
-  const getGroupAdmins: (groupId: string) => Promise<Contact[]>;
+  const getGroupAdmins: (groupId: string) => Promise<ContactId[]>;
   const removeParticipant: (groupId: string, contactId: string) => Promise<boolean>;
   const addOrRemoveLabels: (label: string, id: string, type: string) => Promise<boolean>;
   const promoteParticipant: (groupId: string, contactId: string) => Promise<boolean>;
@@ -161,6 +180,7 @@ declare module WAPI {
   const isChatOnline: (id: string) => Promise<boolean>;
   const sendLinkWithAutoPreview: (to: string,url: string,text: string) => Promise<string | boolean>;
   const contactBlock: (id: string) => Promise<boolean>;
+  const REPORTSPAM: (id: string) => Promise<boolean>;
   const contactUnblock: (id: string) => Promise<boolean>;
   const deleteConversation: (chatId: string) => Promise<boolean>;
   const clearChat: (chatId: string) => Promise<any>;
@@ -173,9 +193,8 @@ declare module WAPI {
     to: string,
     filename: string,
     caption: string,
-    quotedMsgId?: string,
-    waitForId?: boolean,
-    ptt?: boolean
+    type: string,
+    quotedMsgId?: string
   ) => Promise<string>;
   const sendMessageWithThumb: (
     thumb: string,
@@ -194,7 +213,9 @@ declare module WAPI {
     base64: string,
     to: string,
     filename: string,
-    caption: string
+    caption: string,
+    type: string,
+    quotedMsgId?: string
   ) => Promise<string>;
   const sendVideoAsGif: (
     base64: string,
@@ -244,6 +265,7 @@ declare module WAPI {
   const simulateTyping: (to: string, on: boolean) => Promise<boolean>;
   const archiveChat: (id: string, archive: boolean) => Promise<boolean>;
   const isConnected: () => Boolean;
+  const kill: () => Boolean;
   const loadEarlierMessages: (contactId: string) => Promise<Message []>;
   const loadAllEarlierMessages: (contactId: string) => any;
   const getUnreadMessages: (
@@ -319,11 +341,6 @@ export class Client {
      await this._reInjectWapi();
      if (this._createConfig?.licenseKey) {
       const { me } = await this.getMe();
-      const { data } = await axios.post(pkg.licenseCheckUrl, { key: this._createConfig.licenseKey, number: me._serialized, ...this._sessionInfo });
-      if (data) {
-        await this._page.evaluate(data => eval(data), data);
-        console.log('License Valid');
-      } else console.log('Invalid license key');
     }
     await this._page.evaluate('Object.freeze(window.WAPI)');
     await this._reRegisterListeners();
@@ -394,21 +411,21 @@ export class Client {
    * @fires Observable stream of messages
    */
   public async onMessage(fn: (message: Message) => void) {
-    return this.registerListener(SimpleListener.Message, fn);
-    // let funcName = SimpleListener.Message;
-    // this._listeners[funcName] = fn;
-    // const set = () => this.pup(
-    //   ({funcName}) => {
-    //     WAPI.waitNewMessages(false, data => {
-    //       data.forEach(message => {
-    //         //@ts-ignore
-    //         window[funcName](message);
-    //       });
-    //     });
-    //   },{funcName})
-    //   const exists = await this.pup(({funcName})=>window[funcName]?true:false,{funcName});
-    //   if(exists) return await set();
-    // this._page.exposeFunction(funcName, (message: Message) =>fn(message)).then(set).catch(e=>set);
+  //return this.registerListener(SimpleListener.Message, fn);
+  let funcName = SimpleListener.Message;
+  this._listeners[funcName] = fn;
+   const set = () => this.pup(
+     ({funcName}) => {
+       WAPI.waitNewMessages(false, data => {
+         data.forEach(message => {
+           //@ts-ignore
+           window[funcName](message);
+         });
+       });
+     },{funcName})
+     const exists = await this.pup(({funcName})=>window[funcName]?true:false,{funcName});
+     if(exists) return await set();
+   this._page.exposeFunction(funcName, (message: Message) =>fn(message)).then(set).catch(e=>set);
   }
 
  
@@ -420,10 +437,22 @@ export class Client {
    * 
    * @event 
    * @param to callback
-   * @fires Message 
+   * @fires [[Message]] 
    */
   public async onAnyMessage(fn: (message: Message) => void) {
-    return this.registerListener(SimpleListener.AnyMessage, fn);
+  //return this.registerListener(SimpleListener.AnyMessage, fn);
+  }
+  /**
+   * [REQUIRES AN INSIDERS LICENSE-KEY](https://gumroad.com/l/BTMt?tier=Insiders%20Program)
+   * 
+   * Listens to when a message is deleted by a recipient or the host account
+
+   * @event 
+   * @param fn callback
+   * @fires [[Message]]
+   */
+  public async onMessageDeleted(fn: (message: Message) => void) {
+    return this.registerListener(SimpleListener.MessageDeleted, fn);
   }
 
   /** 
@@ -464,7 +493,7 @@ export class Client {
    * ```
    */
   public async onStory(fn: (story: any) => void) {
-    return this.registerListener(SimpleListener.Story, fn);
+  //return this.registerListener(SimpleListener.Story, fn);
   }
 
   /**
@@ -525,7 +554,7 @@ export class Client {
    * @returns Observable stream of participantChangedEvent
    */
   public async onGlobalParicipantsChanged(fn: (participantChangedEvent: ParticipantChangedEventModel) => void) {
-    return this.registerListener(SimpleListener.GlobalParicipantsChanged, fn);
+  //return this.registerListener(SimpleListener.GlobalParicipantsChanged, fn);
   }
 
 
@@ -537,7 +566,7 @@ export class Client {
    * @returns Observable stream of Chats
    */
   public async onAddedToGroup(fn: (chat: Chat) => any) {
-    return this.registerListener(SimpleListener.AddedToGroup, fn);
+  //return this.registerListener(SimpleListener.AddedToGroup, fn);
   }
   
 
@@ -551,7 +580,7 @@ export class Client {
    * @returns Observable stream of Chats
    */
   public async onRemovedFromGroup(fn: (chat: Chat) => any) {
-    return this.registerListener(SimpleListener.RemovedFromGroup, fn);
+  //return this.registerListener(SimpleListener.RemovedFromGroup, fn);
   }
 
   /**
@@ -577,7 +606,7 @@ export class Client {
    * @returns Observable stream of contact ids
    */
   public async onContactAdded(fn: (chat: Chat) => any) {
-    return this.registerListener(SimpleListener.ChatOpened, fn);
+  //return this.registerListener(SimpleListener.ChatOpened, fn);
   }
 
   // cOMPLEX LISTENERS
@@ -777,13 +806,6 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
    * @param content text message
    */
   public async sendText(to: ChatId, content: Content) {
-   const err = [
-    'Not able to send message to broadcast',
-    'Not a contact',
-    'Error: Number not linked to WhatsApp Account',
-    'ERROR: Please make sure you have at least one chat'
-   ];
-
     let res = await this.pup(
       ({ to, content }) => {
         WAPI.sendSeen(to);
@@ -791,10 +813,9 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
       },
       { to, content }
     );
-    if(err.includes(res)) console.error(res);
-    return (err.includes(res) ? false : res)  as boolean | MessageId;
+    return (ERRORS_ARRAY.includes(res) ? ERRORS_ARRAY.find((e) => { return e == res }) : res)  as string | MessageId;
   }
-  
+
 
   /**
    * Sends a text message to given chat that includes mentions.
@@ -948,7 +969,7 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
   /**
    * Sends a image to given chat, with caption or not, using base64
    * @param to chat id xxxxx@c.us
-   * @param base64 base64 data:image/xxx;base64,xxx or the path of the file you want to send.
+   * @param file DataURL data:image/xxx;base64,xxx or the RELATIVE (should start with `./` or `../`) path of the file you want to send. With the latest version, you can now set this to a normal URL (for example [GET] `https://file-examples-com.github.io/uploads/2017/10/file_example_JPG_2500kB.jpg`).
    * @param filename string xxxxx
    * @param caption string xxxxx
    * @param waitForKey boolean default: false set this to true if you want to wait for the id of the message. By default this is set to false as it will take a few seconds to retreive to the key of the message and this waiting may not be desirable for the majority of users.
@@ -959,31 +980,29 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
     file: DataURL | FilePath,
     filename: string,
     caption: Content,
-    quotedMsgId?: MessageId,
-    waitForId?: boolean,
-    ptt?:boolean
+    type:string,
+    quotedMsgId: MessageId,
   ) {
-      //check if the 'base64' file exists
-      if(file.length<50) {
-        let relativePath = path.join(path.resolve(process.cwd(),file|| ''));
-        if(fs.existsSync(file) || fs.existsSync(relativePath)) {
-          file = await datauri(fs.existsSync(file)  ? file : relativePath);
-        }
+    //check if the 'base64' file exists
+    if(!isDataURL(file)) {
+      //must be a file then
+      let relativePath = path.join(path.resolve(process.cwd(),file|| ''));
+      if(fs.existsSync(file) || fs.existsSync(relativePath)) {
+        file = await datauri(fs.existsSync(file)  ? file : relativePath);
+      } else throw new Error('Cannot find file. Make sure the file reference is relative or valid DataURL')
     }
-    
-   const err = [
-    'Not able to send message to broadcast',
-    'Not a contact',
-    'Error: Number not linked to WhatsApp Account',
-    'ERROR: Please make sure you have at least one chat'
-   ];
 
     let res = await this.pup(
-      ({ to, file, filename, caption, quotedMsgId, waitForId, ptt}) =>  WAPI.sendImage(file, to, filename, caption, quotedMsgId, waitForId, ptt),
-      { to, file, filename, caption, quotedMsgId, waitForId, ptt }
-    )
-    if(err.includes(res)) console.error(res);
-    return (err.includes(res) ? false : res)  as MessageId | boolean;
+      ({ to, file, filename, caption, type, quotedMsgId}) => {
+        if (!WAPI.getChat(to)) {
+          return 'ERROR: not a valid chat';
+        } else {
+          return WAPI.sendFile(file, to, filename, caption, type, quotedMsgId);
+        }
+      },
+      { to, file, filename, caption, type, quotedMsgId }
+    );
+    return (ERRORS_ARRAY.includes(res) ? ERRORS_ARRAY.find((e) => { return e == res }) : res)  as string | MessageId;
   }
 
   
@@ -1016,6 +1035,8 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
 
   /**
    * 
+   * Sends a reply to a given message. Please note, you need to have at least sent one normal message to a contact in order for this to work properly.
+   * 
    * @param to string chatid
    * @param content string reply text
    * @param quotedMsgId string the msg id to reply to.
@@ -1024,16 +1045,26 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
    */
   public async reply(to: ChatId, content: Content, quotedMsgId: MessageId, sendSeen?: boolean) {
     if(sendSeen) await this.sendSeen(to);
-    return await this.pup(
-      ({ to, content, quotedMsgId }) =>WAPI.reply(to, content, quotedMsgId),
+
+    let res = await this.pup(
+      ({ to, content, quotedMsgId }) => {
+        if (!WAPI.getChat(to)) {
+          return WAPI.sendMessageToID(to, content);
+        } else {
+          return WAPI.reply(to, content, quotedMsgId);
+        }
+      },
       { to, content, quotedMsgId }
-    ) as Promise<string | boolean>;
+    );
+
+    return (ERRORS_ARRAY.includes(res) ? ERRORS_ARRAY.find((e) => { return e == res }) : res)  as string | MessageId;
+
   }
 
   /**
    * Sends a file to given chat, with caption or not, using base64. This is exactly the same as sendImage
    * @param to chat id xxxxx@c.us
-   * @param base64 base64 data:image/xxx;base64,xxx or the path of the file you want to send.
+   * @param file DataURL data:image/xxx;base64,xxx or the RELATIVE (should start with `./` or `../`) path of the file you want to send. With the latest version, you can now set this to a normal URL (for example [GET] `https://file-examples-com.github.io/uploads/2017/10/file_example_JPG_2500kB.jpg`).
    * @param filename string xxxxx
    * @param caption string xxxxx
    * @param quotedMsgId string true_0000000000@c.us_JHB2HB23HJ4B234HJB to send as a reply to a message
@@ -1045,15 +1076,16 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
     file: DataURL | FilePath,
     filename: string,
     caption: Content,
+    type:string,
     quotedMsgId?: MessageId,
     waitForId?: boolean
   ) {
-    return this.sendImage(to, file, filename, caption, quotedMsgId, waitForId);
+    return this.sendImage(to, file, filename, caption, type, quotedMsgId);
   }
 
 
   /**
-   * Sends a file to given chat, with caption or not, using base64. This is exactly the same as sendImage
+   * Attempts to send a file as a voice note. Useful if you want to send an mp3 file.
    * @param to chat id xxxxx@c.us
    * @param base64 base64 data:image/xxx;base64,xxx or the path of the file you want to send.
    * @param quotedMsgId string true_0000000000@c.us_JHB2HB23HJ4B234HJB to send as a reply to a message
@@ -1064,8 +1096,20 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
     file: DataURL | FilePath,
     quotedMsgId: MessageId,
   ) {
-    return this.sendImage(to, file, 'ptt.ogg', '', quotedMsgId, true, true);
+    return this.sendImage(to, file, 'ptt.ogg', '', 'ptt', quotedMsgId);
   }
+  
+  /**
+   * Alias for [[sendPtt]]
+   */
+  public async sendAudio(
+    to: ChatId,
+    file: DataURL | FilePath,
+    quotedMsgId: MessageId,
+  ) {
+    return this.sendPtt(to, file,quotedMsgId);
+  }
+
 
 
 
@@ -1138,13 +1182,14 @@ public async onLiveLocation(chatId: ChatId, fn: (liveLocationChangedEvent: LiveL
     url: string,
     filename: string,
     caption: Content,
+    type:string,
     quotedMsgId?: MessageId,
     requestConfig: any = {},
-    waitForId?: boolean
+    waitForId?: boolean,
   ) {
     try {
      const base64 = await getDUrl(url, requestConfig);
-      return await this.sendFile(to,base64,filename,caption,quotedMsgId,waitForId)
+      return await this.sendFile(to,base64,filename,caption,type, quotedMsgId,waitForId)
     } catch(error) {
       console.log('Something went wrong', error);
       throw error;
@@ -1459,6 +1504,18 @@ public async contactBlock(id: ContactId) {
   return await this.pup(id => WAPI.contactBlock(id),id)
 }
 
+
+/**
+ * Report a contact for spam, block them and attempt to clear chat.
+ * 
+ * [This is a restricted feature and requires a restricted key.](https://gumroad.com/l/BTMt?tier=1%20Restricted%20License%20Key)
+ * 
+ * @param {string} id '000000000000@c.us'
+ */
+public async reportSpam(id: ContactId | ChatId) {
+  return await this.pup(id => WAPI.REPORTSPAM(id),id)
+}
+
 /**
  * Unblock contact 
  * @param {string} id '000000000000@c.us'
@@ -1547,6 +1604,18 @@ public async contactUnblock(id: ContactId) {
     return await this.pup(
       messageId => WAPI.getMessageById(messageId),
       messageId
+    ) as Promise<Message>;
+  }
+
+  /**
+   * Retrieves the last message sent by the host account in any given chat or globally.
+   * @param chatId This is optional. If no chat Id is set then the last message sent by the host account will be returned.
+   * @returns message object
+   */
+  public async getMyLastMessage(chatId?: ChatId) {
+    return await this.pup(
+      chatId => WAPI.getMyLastMessage(chatId),
+      chatId
     ) as Promise<Message>;
   }
 
@@ -2015,6 +2084,8 @@ public async getStatus(contactId: ContactId) {
   }
 
   /**
+  * [REQUIRES AN INSIDERS LICENSE-KEY](https://gumroad.com/l/BTMt?tier=Insiders%20Program)
+  * 
   * Change who can and cannot speak in a group
   * @param groupId '0000000000-00000000@g.us' the group id.
   * @param onlyAdmins boolean set to true if you want only admins to be able to speak in this group. false if you want to allow everyone to speak in the group
@@ -2080,7 +2151,7 @@ public async getStatus(contactId: ContactId) {
     return await this.pup(
       (groupId) => WAPI.getGroupAdmins(groupId),
       groupId
-    ) as Promise<Contact[]>;
+    ) as Promise<ContactId[]>;
   }
 
   /**
@@ -2122,7 +2193,7 @@ public async getStatus(contactId: ContactId) {
   }
 
   /**
-   * Sends a sticker from a given URL
+   * Sends a sticker (including GIF) from a given URL
    * @param to: The recipient id.
    * @param url: The url of the image
    * @param requestConfig {} By default the request is a get request, however you can override that and many other options by sending this parameter. You can read more about this parameter here: https://github.com/axios/axios#request-config
@@ -2209,12 +2280,12 @@ public async getStatus(contactId: ContactId) {
       let webpBase64 = b64;
       let metadata : any = { width: 512, height: 512 };
       if(!mimeInfo.includes('webp')) {
-      //non matter what, convert to webp, resize + autoscale to width 512 px
-      const scaledImageBuffer = await sharp(buff,{ failOnError: false })
-      .resize({ width: 512, height: 512 })
-      .toBuffer();
-      const webp = sharp(scaledImageBuffer,{ failOnError: false }).webp();
+        const { pages } = await sharp(buff).metadata();
+      //@ts-ignore
+      let webp = sharp(buff,{ failOnError: false, animated: !!pages}).webp();
+      if(!!!pages) webp = webp.resize(metadata);
       metadata = await webp.metadata();
+      metadata.animated = !!pages;
       webpBase64 = (await webp.toBuffer()).toString('base64');
       return {
         metadata,
@@ -2228,10 +2299,10 @@ public async getStatus(contactId: ContactId) {
   }
 
   /**
-   * This function takes an image and sends it as a sticker to the recipient. This is helpful for sending semi-ephemeral things like QR codes. 
+   * This function takes an image (including animated GIF) and sends it as a sticker to the recipient. This is helpful for sending semi-ephemeral things like QR codes. 
    * The advantage is that it will not show up in the recipients gallery. This function automatiicaly converts images to the required webp format.
    * @param to: The recipient id.
-   * @param b64: This is the base64 string formatted with data URI. You can also send a plain base64 string but it may result in an error as the function will not be able to determine the filetype before sending.
+   * @param b64: This is the base64 string formatted as a data URI. 
    */
   public async sendImageAsSticker(to: ChatId, b64: DataURL){
     let processingResponse = await this.prepareWebp(b64);
@@ -2243,18 +2314,19 @@ public async getStatus(contactId: ContactId) {
       );
   }
 
-
-
-
   /**
-   * WORK IN PROGRESS
+   * [WIP]
+   * You can use this to send a raw webp file.
+   * @param to ChatId The chat id you want to send the webp sticker to
+   * @param webpBase64 Base64 The base64 string of the webp file. Not DataURl
+   * @param animated Boolean Set to true if the webp is animated. Default `false`
    */
-  public async sendRawWebpAsSticker(to: ChatId, webpBase64: Base64){
+  public async sendRawWebpAsSticker(to: ChatId, webpBase64: Base64, animated : boolean = false){
     let metadata =  {
   format: 'webp',
   width: 512,
   height: 512,
-  animated: true,
+  animated,
     }
     return await this.pup(
       ({ webpBase64,to, metadata }) => WAPI.sendImageAsSticker(webpBase64,to, metadata),
@@ -2415,17 +2487,34 @@ public async getStatus(contactId: ContactId) {
     if(!url) throw new Error('Missing URL');
     return await this.pup(({ url }) => WAPI.downloadFileWithCredentials(url),{url});
   }
+
+  private async resizeImg(buff: Buffer, size: CreateSize) {
+    const _ins = await sharp(buff, { failOnError: false })
+        .resize({ width: size.width, height: size.height })
+        .toBuffer(),
+      _w = sharp(_ins, { failOnError: false }).jpeg(),
+      _webb64 = (await _w.toBuffer()).toString('base64');
+    return _webb64;
+  }
   
     
   /**
-   * [REQUIRES AN INSIDERS LICENSE-KEY](https://gumroad.com/l/BTMt?tier=Insiders%20Program)
    * 
    * Sets the profile pic of the host number.
-   * @param data string data url image string.
+   * @param b64X96 base64 of 96x96 image.
+   * @param b64X640 base64 of 640x640 image.
+   * @param to chat id: xxxxx@c.us
    * @returns Promise<boolean> success if true
    */
-  public async setProfilePic(data: DataURL){
-    return await this.pup(({ data }) => WAPI.setProfilePic(data),{data}) as Promise<boolean>;
+  public async setProfilePic(b64X96: string, b64X640:string, to: string){
+    return await this.pup(
+      ({ b64X96, b64X640, to }) => WAPI.setProfilePic(b64X96, b64X640, to),
+      {
+        b64X96,
+        b64X640,
+        to,
+      }
+    );
   }
 
   /**

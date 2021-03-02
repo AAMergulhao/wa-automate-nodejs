@@ -1,7 +1,7 @@
 import * as puppeteer from 'puppeteer';
 import * as qrcode from 'qrcode-terminal';
-import { from, merge } from 'rxjs';
-import { take } from 'rxjs/operators';
+import { merge, from } from 'rxjs';
+import { take } from 'rxjs/internal/operators/take';
 import {EvEmitter, ev} from './events'
 import { QRFormat, QRQuality } from '../api/model';
 
@@ -13,13 +13,26 @@ import { QRFormat, QRQuality } from '../api/model';
 export const isAuthenticated = (waPage: puppeteer.Page) => merge(needsToScan(waPage), isInsideChat(waPage)).pipe(take(1)).toPromise()
 
 export const needsToScan = (waPage: puppeteer.Page) => {
-  return from(
-    waPage
+  return from(new Promise(async resolve => {
+    const ident = () => waPage.evaluate(`((()=>{
+      if(window.localStorage['old-logout-cred']==='null'){
+      if(window.Store && window.Store.State) {window.Store.State.default.state="UNPAIRED";window.Store.State.default.run();} return true;
+      } return false;
+      })());`)
+    await Promise.race([
+      waPage.waitForFunction(`window.localStorage['old-logout-cred']=='null'`,
+      { timeout: 0, polling: 100 }),
+      ident()
+    ])
+    //unpair if logged out
+     await ident();
+    //insideqr section
+    await waPage
       .waitForSelector('body > div > div > .landing-wrapper', {
         timeout: 0
       })
-      .then(() => false)
-  );
+      resolve(false)
+  }))
 };
 
 export const isInsideChat = (waPage: puppeteer.Page) => {
