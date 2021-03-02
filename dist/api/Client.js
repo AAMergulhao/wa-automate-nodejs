@@ -692,12 +692,8 @@ var Client = (function () {
                 switch (_a.label) {
                     case 0: return [4, this.pup(function (_a) {
                             var to = _a.to, content = _a.content;
-                            if (!WAPI.getChat(to)) {
-                                return WAPI.sendMessageToID(to, content);
-                            }
-                            else {
-                                return WAPI.sendMessage(to, content);
-                            }
+                            WAPI.sendSeen(to);
+                            WAPI.sendMessageToID(to, content);
                         }, { to: to, content: content })];
                     case 1:
                         res = _a.sent();
